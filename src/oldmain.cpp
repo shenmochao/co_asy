@@ -2,10 +2,112 @@
 #include <coroutine>
 #include <deque>
 #include <queue>
+#include <span>
 #include <thread>
+#include <rbtree.hpp>
 #include <debug.hpp>
 
 using namespace std::chrono_literals;
+
+
+template <class T = void>
+struct NonVoidHelper {
+    using Type = T;
+};
+
+template <>
+struct NonVoidHelper<void> {
+    using Type = NonVoidHelper;
+
+    explicit NonVoidHelper() = default;
+    // 表示这个结构体有一个显式的默认构造函数
+    // explicit 关键字防止了构造函数的隐式转换
+    // 而 = default 表示使用编译器生成的默认构造函数。
+};
+
+// 封装未初始化的值模板
+template <class T>
+struct Uninitialized {
+    // 不会自动调用成员mValue的构造函数来初始化
+    // 因此其内存释放也需要额外管理
+    union {
+        T mValue;
+    };
+
+    Uninitialized() noexcept {}
+    Uninitialized(Uninitialized &&) = delete;
+    ~Uninitialized() noexcept {}
+
+    // 手动调用 T 类型对象的析构函数,Union需要显式析构
+    T moveValue() {
+        T ret(std::move(mValue));
+        mValue.~T();
+        return ret;
+    }
+
+    template <class... Ts> void putValue(Ts &&...args) {
+        // addressof()获取地址
+        new (std::addressof(mValue)) T(std::forward<Ts>(args)...);
+        //定位new表达式（placement new）
+        //它允许你在已经分配的内存上直接构造对象
+        //手动构造一个类型为 T 的对象
+        //并将其放置在 mResult 所指向的内存地址上
+        // forward<Ts>保证了参数 args 的完美转发
+        // 即保持了参数的原始值类别（左值或右值）。
+    }
+};
+
+template <>
+struct Uninitialized<void> {
+    auto moveValue() {
+        return NonVoidHelper<>{};
+    }
+
+    void putValue(NonVoidHelper<>) {}
+};
+//特化版本，它们处理常量类型、左值引用类型和右值引用类型的情况
+template <class T> struct Uninitialized<T const> : Uninitialized<T> {};
+
+template <class T>
+struct Uninitialized<T &> : Uninitialized<std::reference_wrapper<T>> {};
+
+template <class T> struct Uninitialized<T &&> : Uninitialized<T> {};
+
+// 自行定义了Awaiter与Awaitable 可以对其功能进行拓展
+// 需要对其进行拓展的原因是RetType和NonVoidRetType
+template <class A>
+concept Awaiter = requires(A a, std::coroutine_handle<> h) {
+    { a.await_ready() };
+    { a.await_suspend(h) };
+    { a.await_resume() };
+};
+
+template <class A>
+concept Awaitable = Awaiter<A> || requires(A a) {
+    { a.operator co_await() } -> Awaiter;
+};
+
+template <class A> struct AwaitableTraits;
+
+template <Awaiter A> struct AwaitableTraits<A> {
+    //在编译时推导出 A 类型的 await_resume 成员函数的返回类型，而不需要构造 A 类型的对象
+    using RetType = decltype(std::declval<A>().await_resume());
+    using NonVoidRetType = NonVoidHelper<RetType>::Type;
+};
+
+template <class A>
+    requires(!Awaiter<A> && Awaitable<A>)
+struct AwaitableTraits<A>
+    : AwaitableTraits<decltype(std::declval<A>().operator co_await())> {};
+
+// 协程句柄安全转换
+// 将coroutine_handle<P>的协程句柄转换为coroutine_handle<To>
+// 其中 P 必须是从 To 派生的类型
+template <class To, std::derived_from<To> P>
+constexpr std::coroutine_handle<To> staticHandleCast(std::coroutine_handle<P> coroutine) {
+    return std::coroutine_handle<To>::from_address(coroutine.address());
+}
+
 
 struct RepeatAwaiter // awaiter(原始指针) / awaitable(operator->)
 {
@@ -61,28 +163,21 @@ struct Promise {
     void unhandled_exception() noexcept {
         mException = std::current_exception();
     }
-    // co_yeild value 的调用
-    auto yield_value(T ret) noexcept {
-        new(&mResult) T(std::move(ret));
-        //定位new表达式（placement new）
-        //它允许你在已经分配的内存上直接构造对象
-        //手动构造一个类型为 T 的对象
-        //并将其放置在 mResult 所指向的内存地址上
-        return std::suspend_always();
+
+    void return_value(T &&ret) {
+        mResult.putValue(std::move(ret));
     }
-    // co_return value 的调用
-    void return_value(T ret) noexcept {
-        new(&mResult) T(std::move(ret));
+
+        // co_return value 的调用
+    void return_value(T const &ret) {
+        mResult.putValue(ret);
     }
 
     T ReturnResult() {
         if(mException) [[unlikely]] {
             std::rethrow_exception(mException);
         }
-        T ret = std::move(mResult);
-        // 手动调用 T 类型对象的析构函数,Union需要显式析构
-        mResult.~T();
-        return ret;
+        return mResult.moveValue();
     }
     // 获取当协程首次挂起时返回给调用者的结果
     // 将结果保存为局部变量
@@ -93,14 +188,10 @@ struct Promise {
 
     std::coroutine_handle<> mPrevious{};
     std::exception_ptr mException{};
-    union {
-        // 注意U别大写hh
-        T mResult;
-    };
+    Uninitialized<T> mResult;
 
-    Promise() noexcept {}
-    Promise(Promise &&) = delete;
-    ~Promise() {}
+    Promise &operator=(Promise &&) = delete;
+    // 删掉默认五个函数
 };
 
 // void类型不能被构造或赋值，需要模板特化
@@ -118,8 +209,7 @@ struct Promise<void> {
         mException = std::current_exception();
     }
 
-    void return_void() noexcept {
-    }
+    void return_void() noexcept {}
 
     void ReturnResult() {
         if (mException) [[unlikely]] {
@@ -134,18 +224,17 @@ struct Promise<void> {
     std::coroutine_handle<> mPrevious{};
     std::exception_ptr mException{};
 
-    Promise() = default;// 相比于重写默认构造函数效率更高
-    Promise(Promise &&) = delete;
-    ~Promise() = default;
+    Promise &operator=(Promise &&) = delete;
+    // 删掉了默认五个函数
     //保持了类的平凡性（triviality）和标准布局（standard layout）
     //平凡的类型通常可以安全地进行内存复制操作
     //如memcpy，并且它们的对象在内存中的布局与C语言中的结构体兼容。
     //类型如果是标准布局的，它的内存布局将与C语言中的结构体相同
 };
 
-template <class T = void>
+template <class T = void, class P = Promise<T>>
 struct Task {
-    using promise_type = Promise<T>;
+    using promise_type = P;
 
     Task(std::coroutine_handle<promise_type> coroutine) noexcept
         : mCoroutine(coroutine) {}
@@ -268,6 +357,200 @@ Task<void> sleep_for(std::chrono::system_clock::duration duration) {
     co_return;
 }
 
+struct ReturnPreviousPromise {
+    auto initial_suspend() noexcept {
+        return std::suspend_always();
+    }
+
+    auto final_suspend() noexcept {
+        return PreviousAwaiter(mPrevious);
+    }
+
+    void unhandled_exception() {
+        throw;
+    }
+
+    void return_value(std::coroutine_handle<> previous) noexcept {
+        mPrevious = previous;
+    }
+
+    auto get_return_object() {
+        return std::coroutine_handle<ReturnPreviousPromise>::from_promise(
+            *this);
+    }
+
+    std::coroutine_handle<> mPrevious{};
+
+    ReturnPreviousPromise &operator=(ReturnPreviousPromise &&) = delete;
+};
+
+struct ReturnPreviousTask {
+    // 为什么不直接用Promise<std::coroutine_handle<>>?
+    // 为什么不直接用Task<std::coroutine_handle<>>?
+    using promise_type = ReturnPreviousPromise;
+
+    ReturnPreviousTask(std::coroutine_handle<promise_type> coroutine) noexcept
+        : mCoroutine(coroutine) {}
+
+    ReturnPreviousTask(ReturnPreviousTask &&) = delete;
+
+    ~ReturnPreviousTask() {
+        mCoroutine.destroy();
+    }
+
+    std::coroutine_handle<promise_type> mCoroutine;
+};
+
+struct WhenAllCtlBlock {
+    std::size_t mCount;
+    std::coroutine_handle<> mPrevious{};
+    std::exception_ptr mException{};
+};
+
+struct WhenAllAwaiter {
+    bool await_ready() const noexcept {
+        return false;
+    }
+
+    std::coroutine_handle<>
+    await_suspend(std::coroutine_handle<> coroutine) const {
+        if (mTasks.empty()) return coroutine;
+        mControl.mPrevious = coroutine;
+        for (auto const &t: mTasks.subspan(1))
+            // 将除第一个任务外的其他所有任务添加到事件循环中
+            getLoop().addTask(t.mCoroutine);
+        // 返回第一个任务的协程句柄，以便继续执行。
+        return mTasks.front().mCoroutine;
+    }
+
+    void await_resume() const {
+        if (mControl.mException) [[unlikely]] {
+            std::rethrow_exception(mControl.mException);
+        }
+    }
+
+    WhenAllCtlBlock &mControl;
+    std::span<ReturnPreviousTask const> mTasks;
+};
+
+template <class T>
+ReturnPreviousTask whenAllHelper(auto const &t, WhenAllCtlBlock &control,
+                                 Uninitialized<T> &result) {
+    try {
+        // 等待任务 t 完成，并将结果存储在 result 中
+        result.putValue(co_await t);
+    } catch (...) {
+        // 如果任务 t 抛出异常，捕获异常并存储在控制块中
+        control.mException = std::current_exception();
+        // 提前返回之前挂起的协程句柄
+        co_return control.mPrevious;
+    }
+    --control.mCount;
+    // 如果所有任务都已完成（计数为0），返回之前挂起的协程句柄
+    if (control.mCount == 0) {
+        co_return control.mPrevious;
+    }
+    // 还有任务没完成，返回nullptr
+    co_return nullptr;
+}
+template <std::size_t... Is, class... Ts>
+Task<std::tuple<typename AwaitableTraits<Ts>::NonVoidRetType...>>
+whenAllImpl(std::index_sequence<Is...>, Ts &&...ts) {
+    // 创建控制块对象
+    WhenAllCtlBlock control{sizeof...(Ts)};
+    // 用于存储每个异步操作的结果，同时留着空间未初始化
+    std::tuple<Uninitialized<typename AwaitableTraits<Ts>::RetType>...> result;
+    // 创建了一个任务数组
+    ReturnPreviousTask taskArray[]{whenAllHelper(ts, control, std::get<Is>(result))...};
+    // 挂起等待
+    co_await WhenAllAwaiter(control, taskArray);
+    // 返回结果
+    co_return std::tuple<typename AwaitableTraits<Ts>::NonVoidRetType...>(
+        std::get<Is>(result).moveValue()...);
+}
+
+
+// 编译时检查，确保传入的异步操作数量不为零
+template <Awaitable... Ts>
+    requires(sizeof...(Ts) != 0)
+auto when_all(Ts &&...ts) {
+    // （编译时生成的索引序列, 任务）
+    return whenAllImpl(std::make_index_sequence<sizeof...(Ts)>{},
+                       std::forward<Ts>(ts)...);
+}
+
+struct WhenAnyCtlBlock {
+    static constexpr std::size_t kNullIndex = std::size_t(-1);
+    // 初始化为最大值，表示开始时没有任何协程完成
+    std::size_t mIndex{kNullIndex};
+    std::coroutine_handle<> mPrevious{};
+    std::exception_ptr mException{};
+};
+
+struct WhenAnyAwaiter {
+    bool await_ready() const noexcept {
+        return false;
+    }
+
+    std::coroutine_handle<>
+    await_suspend(std::coroutine_handle<> coroutine) const {
+        if (mTasks.empty()) return coroutine;
+        mControl.mPrevious = coroutine;
+        for (auto const &t: mTasks.subspan(1))
+            getLoop().addTask(t.mCoroutine);
+        return mTasks.front().mCoroutine;
+    }
+
+    void await_resume() const {
+        // 在恢复前抛出异常
+        if (mControl.mException) [[unlikely]] {
+            std::rethrow_exception(mControl.mException);
+        }
+    }
+
+    WhenAnyCtlBlock &mControl;
+    std::span<ReturnPreviousTask const> mTasks;
+};
+
+template <class T>
+ReturnPreviousTask whenAnyHelper(auto const &t, WhenAnyCtlBlock &control,
+                                 Uninitialized<T> &result, std::size_t index) {
+    try {
+        result.putValue(co_await t);
+    } catch (...) {
+        control.mException = std::current_exception();
+        co_return control.mPrevious;
+    }
+    --control.mIndex = index;
+    // 有任务完成就返回
+    co_return control.mPrevious;
+}
+
+template <std::size_t... Is, class... Ts>
+Task<std::variant<typename AwaitableTraits<Ts>::NonVoidRetType...>>
+whenAnyImpl(std::index_sequence<Is...>, Ts &&...ts) {
+    WhenAnyCtlBlock control{};
+    std::tuple<Uninitialized<typename AwaitableTraits<Ts>::RetType>...> result;
+    ReturnPreviousTask taskArray[]{whenAnyHelper(ts, control, std::get<Is>(result), Is)...};
+    co_await WhenAnyAwaiter(control, taskArray);
+    Uninitialized<std::variant<typename AwaitableTraits<Ts>::NonVoidRetType...>> varResult;
+    // 折叠表达式，执行左边语句，然后执行右边语句，最后返回右边表达式的结果
+    // 遍历所有可能的索引 Is，并检查 control.mIndex 是否等于每个索引。
+    // 如果是，它将使用 std::in_place_index<Is> 来构造 varResult 中的正确类型，并将对应的结果移动到变体中
+    // 返回值为0
+    ((control.mIndex == Is && (varResult.putValue(
+        std::in_place_index<Is>, std::get<Is>(result).moveValue()), 0)), ...);
+    // moveValue是对Uninitialized类中union成员的析构
+    co_return varResult.moveValue();
+}
+
+template <Awaitable... Ts>
+    requires(sizeof...(Ts) != 0)
+auto when_any(Ts &&...ts) {
+    return whenAnyImpl(std::make_index_sequence<sizeof...(Ts)>{},
+                       std::forward<Ts>(ts)...);
+}
+
 Task<int> hello1() {
     debug(), "hello1开始睡1秒";
     co_await sleep_for(1s); // 1s 等价于 std::chrono::seconds(1)
@@ -282,13 +565,21 @@ Task<int> hello2() {
     co_return 2;
 }
 
+Task<int> hello() {
+    auto a = co_await hello1();
+    debug(), "hello: a = ", a;
+    auto b = co_await hello2();
+    debug(), "hello: b = ", b;
+    debug(), "hello开始等1和2";
+    auto v = co_await when_any(hello1(), hello2());
+    debug(), "hello看到", (int)v.index() + 1, "睡醒了"; // 有问题，下午改，应该是line:352 promise的问题
+    co_return std::get<0>(v);
+}
+
 int main() {
-    auto t1 = hello1();
-    auto t2 = hello2();
-    getLoop().addTask(t1);// 加入任务队列
-    getLoop().addTask(t2);
+    auto t = hello();
+    getLoop().addTask(t);
     getLoop().runAll();
-    debug(), "主函数中得到hello1结果:", t1.mCoroutine.promise().ReturnResult();
-    debug(), "主函数中得到hello2结果:", t2.mCoroutine.promise().ReturnResult();
+    debug(), "主函数中得到hello结果:", t.mCoroutine.promise().ReturnResult();
     return 0;
 }

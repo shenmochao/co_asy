@@ -4,6 +4,7 @@
 #include <queue>
 #include <span>
 #include <thread>
+#include <rbtree.hpp>
 #include <debug.hpp>
 
 using namespace std::chrono_literals;
@@ -98,6 +99,15 @@ template <class A>
     requires(!Awaiter<A> && Awaitable<A>)
 struct AwaitableTraits<A>
     : AwaitableTraits<decltype(std::declval<A>().operator co_await())> {};
+
+// 协程句柄安全转换
+// 将coroutine_handle<P>的协程句柄转换为coroutine_handle<To>
+// 其中 P 必须是从 To 派生的类型
+template <class To, std::derived_from<To> P>
+constexpr std::coroutine_handle<To> staticHandleCast(std::coroutine_handle<P> coroutine) {
+    return std::coroutine_handle<To>::from_address(coroutine.address());
+}
+
 
 struct RepeatAwaiter // awaiter(原始指针) / awaitable(operator->)
 {
@@ -199,8 +209,7 @@ struct Promise<void> {
         mException = std::current_exception();
     }
 
-    void return_void() noexcept {
-    }
+    void return_void() noexcept {}
 
     void ReturnResult() {
         if (mException) [[unlikely]] {
@@ -223,9 +232,9 @@ struct Promise<void> {
     //类型如果是标准布局的，它的内存布局将与C语言中的结构体相同
 };
 
-template <class T = void>
+template <class T = void, class P = Promise<T>>
 struct Task {
-    using promise_type = Promise<T>;
+    using promise_type = P;
 
     Task(std::coroutine_handle<promise_type> coroutine) noexcept
         : mCoroutine(coroutine) {}
@@ -261,55 +270,53 @@ struct Task {
 
     std::coroutine_handle<promise_type> mCoroutine;
 };
+
+// 继承自红黑树，可以按照时间排列，唤醒协程
+struct SleepUntilPromise : RbTree<SleepUntilPromise>::RbNode, Promise<void> {
+    std::chrono::system_clock::time_point mExpireTime;
+
+    auto get_return_object() {
+        return std::coroutine_handle<SleepUntilPromise>::from_promise(*this);
+    }
+
+    SleepUntilPromise &operator=(SleepUntilPromise &&) = delete;
+
+    friend bool operator<(SleepUntilPromise const &lhs, SleepUntilPromise const &rhs) noexcept {
+        return lhs.mExpireTime < rhs.mExpireTime;
+    }
+};
+
 // 调度器
-struct Loop{
-    // 就绪队列，存储句柄
-    std::deque<std::coroutine_handle<>> mReadyQueue;
-    // 时间表项
-    struct TimerEntry{
-        // 过期时间点
-        std::chrono::system_clock::time_point expireTime;
-        // 目标协程句柄
-        std::coroutine_handle<> coroutine;
-        // 重载比较"<"运算符
-        bool operator<(TimerEntry const &that) const noexcept {
-            return expireTime > that.expireTime;
-        }
-    };
-    // 优先队列（大顶堆）
-    std::priority_queue<TimerEntry> mTimerHeap;
-    // 加入任务队列
-    void addTask(std::coroutine_handle<> coroutine) {
-        mReadyQueue.push_front(coroutine);
+struct Loop {
+    // 构建红黑树，时间早的默认在前
+    RbTree<SleepUntilPromise> mRbTimer{};
+    // 增加结点
+    void addTimer(SleepUntilPromise &promise) {
+        mRbTimer.insert(promise);
     }
-    // 时间点，哪个协程
-    void addTimer(std::chrono::system_clock::time_point expireTime, std::coroutine_handle<> coroutine) {
-        mTimerHeap.push({expireTime, coroutine});
-    }
-    void runAll() {
-        while (!mTimerHeap.empty()||!mReadyQueue.empty()) {
-            while (!mReadyQueue.empty()) {
-                // 就绪队列非空则取出恢复
-                std::coroutine_handle<> coroutine = mReadyQueue.front();
-                mReadyQueue.pop_front();
-                coroutine.resume();
-            }
-            // 堆顶不空且时间点小于当前时间点则出堆，否则等待到该时间
-            // 因为堆顶时间最晚，所以如果该协程被恢复，则说明全部协程都可以被恢复
-            if (!mTimerHeap.empty()) {
-                std::chrono::system_clock::time_point nowTime = std::chrono::system_clock::now();
-                TimerEntry timer = std::move(mTimerHeap.top());
-                if (timer.expireTime < nowTime) {
-                    mTimerHeap.pop();
-                    timer.coroutine.resume();
-                } else {
-                    std::this_thread::sleep_until(timer.expireTime);
+
+    void run(std::coroutine_handle<> coroutine) {
+        while (!coroutine.done()) {
+            // 协程未执行完时，恢复协程继续执行
+            coroutine.resume();
+            while (!mRbTimer.empty()) {
+                // 树不为空时
+                if (!mRbTimer.empty()) {
+                    auto nowTime = std::chrono::system_clock::now();
+                    // 获取最早的时间点
+                    auto &promise = mRbTimer.front();
+                    // 早于当前时间则删除结点，否则睡眠到该时间点
+                    if (promise.mExpireTime < nowTime) {
+                        mRbTimer.erase(promise);
+                        std::coroutine_handle<SleepUntilPromise>::from_promise(promise).resume();
+                    } else {
+                        std::this_thread::sleep_until(promise.mExpireTime);
+                    }
                 }
             }
         }
     }
-    // 删除除了构造函数外的所有函数
-    // 如果是Loop (Loop &&) = delete 就是默认删掉五个函数
+
     Loop &operator=(Loop &&) = delete;
 };
 
@@ -325,26 +332,29 @@ struct SleepAwaiter {
         return false;
     }
 
-    void await_suspend(std::coroutine_handle<> coroutine) const {
-        getLoop().addTimer(expireTime, coroutine);
+    void await_suspend(std::coroutine_handle<SleepUntilPromise> coroutine) const {
+        auto &promise = coroutine.promise();
+        promise.mExpireTime = mExpireTime;
+        loop.addTimer(promise);
     }
 
-    void await_resume() const noexcept {
-    }
+    void await_resume() const noexcept {}
 
-    std::chrono::system_clock::time_point expireTime;
+    Loop &loop;
+    std::chrono::system_clock::time_point mExpireTime;
 };
 
 // 睡眠到什么时间点
-Task<void> sleep_until(std::chrono::system_clock::time_point expireTime) {
-    co_await SleepAwaiter(expireTime);
-    co_return;
+Task<void, SleepUntilPromise> sleep_until(std::chrono::system_clock::time_point expireTime) {
+    auto &loop = getLoop();
+    co_await SleepAwaiter(loop, expireTime);
 }
 
 // 睡眠一段时间
-Task<void> sleep_for(std::chrono::system_clock::duration duration) {
+Task<void, SleepUntilPromise> sleep_for(std::chrono::system_clock::duration duration) {
     // 时间点加时间段等于时间点
-    co_await SleepAwaiter(std::chrono::system_clock::now() + duration);
+    auto &loop = getLoop();
+    co_await SleepAwaiter(loop, std::chrono::system_clock::now() + duration);
     co_return;
 }
 
@@ -407,11 +417,9 @@ struct WhenAllAwaiter {
     await_suspend(std::coroutine_handle<> coroutine) const {
         if (mTasks.empty()) return coroutine;
         mControl.mPrevious = coroutine;
-        for (auto const &t: mTasks.subspan(1))
-            // 将除第一个任务外的其他所有任务添加到事件循环中
-            getLoop().addTask(t.mCoroutine);
-        // 返回第一个任务的协程句柄，以便继续执行。
-        return mTasks.front().mCoroutine;
+        for (auto const &t: mTasks.subspan(0, mTasks.size() - 1))
+            t.mCoroutine.resume();
+        return mTasks.back().mCoroutine;
     }
 
     void await_resume() const {
@@ -444,6 +452,7 @@ ReturnPreviousTask whenAllHelper(auto const &t, WhenAllCtlBlock &control,
     // 还有任务没完成，返回nullptr
     co_return nullptr;
 }
+
 template <std::size_t... Is, class... Ts>
 Task<std::tuple<typename AwaitableTraits<Ts>::NonVoidRetType...>>
 whenAllImpl(std::index_sequence<Is...>, Ts &&...ts) {
@@ -487,9 +496,9 @@ struct WhenAnyAwaiter {
     await_suspend(std::coroutine_handle<> coroutine) const {
         if (mTasks.empty()) return coroutine;
         mControl.mPrevious = coroutine;
-        for (auto const &t: mTasks.subspan(1))
-            getLoop().addTask(t.mCoroutine);
-        return mTasks.front().mCoroutine;
+        for (auto const &t: mTasks.subspan(0, mTasks.size() - 1))
+            t.mCoroutine.resume();
+        return mTasks.back().mCoroutine;
     }
 
     void await_resume() const {
@@ -518,6 +527,7 @@ ReturnPreviousTask whenAnyHelper(auto const &t, WhenAnyCtlBlock &control,
 }
 
 template <std::size_t... Is, class... Ts>
+// variant 只有其中一个为true，其中不能有void
 Task<std::variant<typename AwaitableTraits<Ts>::NonVoidRetType...>>
 whenAnyImpl(std::index_sequence<Is...>, Ts &&...ts) {
     WhenAnyCtlBlock control{};
@@ -562,15 +572,14 @@ Task<int> hello() {
     auto b = co_await hello2();
     debug(), "hello: b = ", b;
     debug(), "hello开始等1和2";
-    auto v = co_await when_any(hello1(), hello2(), hello2());
-    debug(), "hello看到", (int)v.index() + 1, "睡醒了"; // 有问题，下午改，应该是line:352 promise的问题
-    co_return std::get<0>(v);
+    auto v = co_await when_any(hello2(), hello1());
+    debug(), "hello看到", (int)v.index() + 1, "睡醒了";
+    co_return std::get<1>(v);
 }
 
 int main() {
     auto t = hello();
-    getLoop().addTask(t);
-    getLoop().runAll();
+    getLoop().run(t);
     debug(), "主函数中得到hello结果:", t.mCoroutine.promise().ReturnResult();
     return 0;
 }
