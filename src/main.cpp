@@ -348,13 +348,199 @@ Task<void> sleep_for(std::chrono::system_clock::duration duration) {
     co_return;
 }
 
+struct ReturnPreviousPromise {
+    auto initial_suspend() noexcept {
+        return std::suspend_always();
+    }
+
+    auto final_suspend() noexcept {
+        return PreviousAwaiter(mPrevious);
+    }
+
+    void unhandled_exception() {
+        throw;
+    }
+
+    void return_value(std::coroutine_handle<> previous) noexcept {
+        mPrevious = previous;
+    }
+
+    auto get_return_object() {
+        return std::coroutine_handle<ReturnPreviousPromise>::from_promise(
+            *this);
+    }
+
+    std::coroutine_handle<> mPrevious{};
+
+    ReturnPreviousPromise &operator=(ReturnPreviousPromise &&) = delete;
+};
+
+struct ReturnPreviousTask {
+    // 为什么不直接用Promise<std::coroutine_handle<>>?
+    // 为什么不直接用Task<std::coroutine_handle<>>?
+    using promise_type = ReturnPreviousPromise;
+
+    ReturnPreviousTask(std::coroutine_handle<promise_type> coroutine) noexcept
+        : mCoroutine(coroutine) {}
+
+    ReturnPreviousTask(ReturnPreviousTask &&) = delete;
+
+    ~ReturnPreviousTask() {
+        mCoroutine.destroy();
+    }
+
+    std::coroutine_handle<promise_type> mCoroutine;
+};
+
 struct WhenAllCtlBlock {
     std::size_t mCount;
     std::coroutine_handle<> mPrevious{};
     std::exception_ptr mException{};
 };
 
+struct WhenAllAwaiter {
+    bool await_ready() const noexcept {
+        return false;
+    }
 
+    std::coroutine_handle<>
+    await_suspend(std::coroutine_handle<> coroutine) const {
+        if (mTasks.empty()) return coroutine;
+        mControl.mPrevious = coroutine;
+        for (auto const &t: mTasks.subspan(1))
+            // 将除第一个任务外的其他所有任务添加到事件循环中
+            getLoop().addTask(t.mCoroutine);
+        // 返回第一个任务的协程句柄，以便继续执行。
+        return mTasks.front().mCoroutine;
+    }
+
+    void await_resume() const {
+        if (mControl.mException) [[unlikely]] {
+            std::rethrow_exception(mControl.mException);
+        }
+    }
+
+    WhenAllCtlBlock &mControl;
+    std::span<ReturnPreviousTask const> mTasks;
+};
+
+template <class T>
+ReturnPreviousTask whenAllHelper(auto const &t, WhenAllCtlBlock &control,
+                                 Uninitialized<T> &result) {
+    try {
+        // 等待任务 t 完成，并将结果存储在 result 中
+        result.putValue(co_await t);
+    } catch (...) {
+        // 如果任务 t 抛出异常，捕获异常并存储在控制块中
+        control.mException = std::current_exception();
+        // 提前返回之前挂起的协程句柄
+        co_return control.mPrevious;
+    }
+    --control.mCount;
+    // 如果所有任务都已完成（计数为0），返回之前挂起的协程句柄
+    if (control.mCount == 0) {
+        co_return control.mPrevious;
+    }
+    // 还有任务没完成，返回nullptr
+    co_return nullptr;
+}
+template <std::size_t... Is, class... Ts>
+Task<std::tuple<typename AwaitableTraits<Ts>::NonVoidRetType...>>
+whenAllImpl(std::index_sequence<Is...>, Ts &&...ts) {
+    // 创建控制块对象
+    WhenAllCtlBlock control{sizeof...(Ts)};
+    // 用于存储每个异步操作的结果，同时留着空间未初始化
+    std::tuple<Uninitialized<typename AwaitableTraits<Ts>::RetType>...> result;
+    // 创建了一个任务数组
+    ReturnPreviousTask taskArray[]{whenAllHelper(ts, control, std::get<Is>(result))...};
+    // 挂起等待
+    co_await WhenAllAwaiter(control, taskArray);
+    // 返回结果
+    co_return std::tuple<typename AwaitableTraits<Ts>::NonVoidRetType...>(
+        std::get<Is>(result).moveValue()...);
+}
+
+
+// 编译时检查，确保传入的异步操作数量不为零
+template <Awaitable... Ts>
+    requires(sizeof...(Ts) != 0)
+auto when_all(Ts &&...ts) {
+    // （编译时生成的索引序列, 任务）
+    return whenAllImpl(std::make_index_sequence<sizeof...(Ts)>{},
+                       std::forward<Ts>(ts)...);
+}
+
+struct WhenAnyCtlBlock {
+    static constexpr std::size_t kNullIndex = std::size_t(-1);
+    // 初始化为最大值，表示开始时没有任何协程完成
+    std::size_t mIndex{kNullIndex};
+    std::coroutine_handle<> mPrevious{};
+    std::exception_ptr mException{};
+};
+
+struct WhenAnyAwaiter {
+    bool await_ready() const noexcept {
+        return false;
+    }
+
+    std::coroutine_handle<>
+    await_suspend(std::coroutine_handle<> coroutine) const {
+        if (mTasks.empty()) return coroutine;
+        mControl.mPrevious = coroutine;
+        for (auto const &t: mTasks.subspan(1))
+            getLoop().addTask(t.mCoroutine);
+        return mTasks.front().mCoroutine;
+    }
+
+    void await_resume() const {
+        // 在恢复前抛出异常
+        if (mControl.mException) [[unlikely]] {
+            std::rethrow_exception(mControl.mException);
+        }
+    }
+
+    WhenAnyCtlBlock &mControl;
+    std::span<ReturnPreviousTask const> mTasks;
+};
+
+template <class T>
+ReturnPreviousTask whenAnyHelper(auto const &t, WhenAnyCtlBlock &control,
+                                 Uninitialized<T> &result, std::size_t index) {
+    try {
+        result.putValue(co_await t);
+    } catch (...) {
+        control.mException = std::current_exception();
+        co_return control.mPrevious;
+    }
+    --control.mIndex = index;
+    // 有任务完成就返回
+    co_return control.mPrevious;
+}
+
+template <std::size_t... Is, class... Ts>
+Task<std::variant<typename AwaitableTraits<Ts>::NonVoidRetType...>>
+whenAnyImpl(std::index_sequence<Is...>, Ts &&...ts) {
+    WhenAnyCtlBlock control{};
+    std::tuple<Uninitialized<typename AwaitableTraits<Ts>::RetType>...> result;
+    ReturnPreviousTask taskArray[]{whenAnyHelper(ts, control, std::get<Is>(result), Is)...};
+    co_await WhenAnyAwaiter(control, taskArray);
+    Uninitialized<std::variant<typename AwaitableTraits<Ts>::NonVoidRetType...>> varResult;
+    // 折叠表达式，执行左边语句，然后执行右边语句，最后返回右边表达式的结果
+    // 遍历所有可能的索引 Is，并检查 control.mIndex 是否等于每个索引。
+    // 如果是，它将使用 std::in_place_index<Is> 来构造 varResult 中的正确类型，并将对应的结果移动到变体中
+    // 返回值为0
+    ((control.mIndex == Is && (varResult.putValue(
+        std::in_place_index<Is>, std::get<Is>(result).moveValue()), 0)), ...);
+    // moveValue是对Uninitialized类中union成员的析构
+    co_return varResult.moveValue();
+}
+
+template <Awaitable... Ts>
+    requires(sizeof...(Ts) != 0)
+auto when_any(Ts &&...ts) {
+    return whenAnyImpl(std::make_index_sequence<sizeof...(Ts)>{},
+                       std::forward<Ts>(ts)...);
+}
 
 Task<int> hello1() {
     debug(), "hello1开始睡1秒";
@@ -371,11 +557,13 @@ Task<int> hello2() {
 }
 
 Task<int> hello() {
+    auto a = co_await hello1();
+    debug(), "hello: a = ", a;
+    auto b = co_await hello2();
+    debug(), "hello: b = ", b;
     debug(), "hello开始等1和2";
     auto v = co_await when_any(hello1(), hello2(), hello2());
-    /* co_await hello1(); */
-    /* co_await hello2(); */
-    debug(), "hello看到", (int)v.index() + 1, "睡醒了";
+    debug(), "hello看到", (int)v.index() + 1, "睡醒了"; // 有问题，下午改，应该是line:352 promise的问题
     co_return std::get<0>(v);
 }
 
@@ -383,6 +571,6 @@ int main() {
     auto t = hello();
     getLoop().addTask(t);
     getLoop().runAll();
-    debug(), "主函数中得到hello结果:", t.mCoroutine.promise().result();
+    debug(), "主函数中得到hello结果:", t.mCoroutine.promise().ReturnResult();
     return 0;
 }
